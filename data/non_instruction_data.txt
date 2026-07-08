@@ -1,0 +1,374 @@
+E-Commerce Platform Database Schema Reference
+
+This document describes the database schema for the client's e-commerce commerce platform. It is written for product support engineers and new developers who join the team. The goal of this reference is to explain what each database table stores, how the tables relate to one another, and which columns are important when writing queries. All custom client tables use the "X_" prefix by convention. Primary keys are numeric surrogate identifiers ending in "_id". Foreign keys reference the primary key of the parent table and follow the same "_id" naming.
+
+The schema is organized into six functional areas: Catalog and Product, Customer and Account, Cart and Order, Shipment and Fulfillment, Payment and Promotion, and Store administration. When answering a data question, always start from the table that owns the primary entity, then join outward using the foreign key relationships described below. Dates are stored as TIMESTAMP values. Monetary amounts are stored as DECIMAL values and are always paired with a currency code column where relevant.
+
+Naming conventions used across the schema: a table that stores images, descriptions, attributes, or line items for a parent entity repeats the parent name as a prefix, for example X_Product_Images and X_Product_Description both hang off X_Product. Mapping tables that connect two entities use both entity names, for example X_Product_Category maps products to categories. Status columns store short uppercase codes such as ACTIVE, INACTIVE, PENDING, SHIPPED, CANCELLED, and REFUNDED.
+
+Catalog and Product Area
+
+The X_Product table is the master catalog table. It stores one row per sellable product concept. Every product image, description, attribute, price, SKU variant, and review ultimately links back to X_Product through the product_id foreign key. A product can have a parent_product_id to support product bundles and variant grouping.
+CREATE TABLE X_Product (
+  product_id BIGINT PRIMARY KEY,
+  product_code VARCHAR(64),
+  product_name VARCHAR(255),
+  brand_id BIGINT,
+  product_type VARCHAR(32),
+  status VARCHAR(16),
+  parent_product_id BIGINT,
+  created_date TIMESTAMP,
+  updated_date TIMESTAMP
+);
+
+The X_Product_Images table stores references to product image assets. Each row points to one image for a product. The image_type column distinguishes THUMBNAIL, FULL, and SWATCH images, and is_primary marks the main image shown on the product page. This is the table to query when someone asks where product images or product pictures are stored.
+CREATE TABLE X_Product_Images (
+  image_id BIGINT PRIMARY KEY,
+  product_id BIGINT REFERENCES X_Product(product_id),
+  image_url VARCHAR(1024),
+  image_type VARCHAR(16),
+  sequence INT,
+  alt_text VARCHAR(255),
+  is_primary CHAR(1)
+);
+
+The X_Product_Description table stores localized marketing text for products. Each row is tied to a language_id so the same product can have descriptions in multiple languages. It holds the short description, the long description, and search keywords.
+CREATE TABLE X_Product_Description (
+  description_id BIGINT PRIMARY KEY,
+  product_id BIGINT REFERENCES X_Product(product_id),
+  language_id INT,
+  short_desc VARCHAR(512),
+  long_desc TEXT,
+  keywords VARCHAR(512)
+);
+
+The X_Product_Attributes table stores flexible name-value specification data for products, such as material, fit, care instructions, or technical specs. Attributes are grouped using attribute_group so related specs can be displayed together.
+CREATE TABLE X_Product_Attributes (
+  attribute_id BIGINT PRIMARY KEY,
+  product_id BIGINT REFERENCES X_Product(product_id),
+  attribute_name VARCHAR(128),
+  attribute_value VARCHAR(512),
+  attribute_group VARCHAR(64)
+);
+
+The X_Category table stores the merchandising category hierarchy. Categories are self-referential through parent_category_id, which lets you build the category tree. display_sequence controls ordering in navigation menus.
+CREATE TABLE X_Category (
+  category_id BIGINT PRIMARY KEY,
+  category_code VARCHAR(64),
+  category_name VARCHAR(255),
+  parent_category_id BIGINT,
+  display_sequence INT,
+  is_active CHAR(1)
+);
+
+The X_Product_Category table is a mapping table that assigns products to categories. Because a product can belong to many categories and a category contains many products, this many-to-many relationship is resolved here. The is_primary column marks the main category for a product.
+CREATE TABLE X_Product_Category (
+  id BIGINT PRIMARY KEY,
+  product_id BIGINT REFERENCES X_Product(product_id),
+  category_id BIGINT REFERENCES X_Category(category_id),
+  is_primary CHAR(1)
+);
+
+The X_Price table stores pricing for products by currency. It holds the list_price and the offer_price, along with the effective start_date and end_date so historical and scheduled pricing can be represented.
+CREATE TABLE X_Price (
+  price_id BIGINT PRIMARY KEY,
+  product_id BIGINT REFERENCES X_Product(product_id),
+  currency VARCHAR(3),
+  list_price DECIMAL(12,2),
+  offer_price DECIMAL(12,2),
+  start_date TIMESTAMP,
+  end_date TIMESTAMP
+);
+
+The X_SKU table stores the individual sellable variants of a product, such as a specific color and size combination. Inventory, cart items, and order items reference the SKU rather than the parent product because stock and purchases happen at the variant level.
+CREATE TABLE X_SKU (
+  sku_id BIGINT PRIMARY KEY,
+  product_id BIGINT REFERENCES X_Product(product_id),
+  sku_code VARCHAR(64),
+  color VARCHAR(64),
+  size VARCHAR(32),
+  upc VARCHAR(32),
+  weight DECIMAL(10,3)
+);
+
+The X_Inventory table stores stock levels per SKU per store. quantity_on_hand is the physical stock, quantity_reserved is stock held for open orders, and reorder_level triggers replenishment. Available-to-promise is typically quantity_on_hand minus quantity_reserved.
+CREATE TABLE X_Inventory (
+  inventory_id BIGINT PRIMARY KEY,
+  sku_id BIGINT REFERENCES X_SKU(sku_id),
+  store_id BIGINT REFERENCES X_Store(store_id),
+  quantity_on_hand INT,
+  quantity_reserved INT,
+  reorder_level INT
+);
+
+The X_Product_Review table stores customer ratings and written reviews for products. Each review links to both the product and the customer who wrote it, carries a numeric rating from 1 to 5, and has a moderation status.
+CREATE TABLE X_Product_Review (
+  review_id BIGINT PRIMARY KEY,
+  product_id BIGINT REFERENCES X_Product(product_id),
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  rating INT,
+  review_title VARCHAR(255),
+  review_text TEXT,
+  review_date TIMESTAMP,
+  status VARCHAR(16)
+);
+
+Customer and Account Area
+
+The X_Customer table is the master customer table. It stores one row per registered shopper and is the parent for addresses, contacts, preferences, wishlists, orders, and reviews. customer_type distinguishes GUEST, REGISTERED, and B2B customers.
+CREATE TABLE X_Customer (
+  customer_id BIGINT PRIMARY KEY,
+  customer_code VARCHAR(64),
+  first_name VARCHAR(128),
+  last_name VARCHAR(128),
+  email VARCHAR(255),
+  registration_date TIMESTAMP,
+  status VARCHAR(16),
+  customer_type VARCHAR(16)
+);
+
+The X_Customer_Address table stores multiple addresses per customer. address_type distinguishes BILLING and SHIPPING addresses, and is_default marks the preferred address of each type.
+CREATE TABLE X_Customer_Address (
+  address_id BIGINT PRIMARY KEY,
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  address_type VARCHAR(16),
+  line1 VARCHAR(255),
+  line2 VARCHAR(255),
+  city VARCHAR(128),
+  state VARCHAR(128),
+  postal_code VARCHAR(32),
+  country VARCHAR(64),
+  is_default CHAR(1)
+);
+
+The X_Customer_Contact table stores contact points for a customer such as phone numbers and alternate emails. contact_type identifies the kind of contact and is_verified indicates whether it has been confirmed.
+CREATE TABLE X_Customer_Contact (
+  contact_id BIGINT PRIMARY KEY,
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  contact_type VARCHAR(32),
+  contact_value VARCHAR(255),
+  is_verified CHAR(1)
+);
+
+The X_Customer_Preference table stores per-customer settings and marketing opt-ins. It holds generic key-value preferences plus explicit opt_in_email and opt_in_sms flags used for communication consent.
+CREATE TABLE X_Customer_Preference (
+  preference_id BIGINT PRIMARY KEY,
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  pref_key VARCHAR(64),
+  pref_value VARCHAR(255),
+  opt_in_email CHAR(1),
+  opt_in_sms CHAR(1)
+);
+
+The X_Wishlist table stores wishlists created by customers. A customer may have several wishlists, and is_public controls whether the wishlist can be shared.
+CREATE TABLE X_Wishlist (
+  wishlist_id BIGINT PRIMARY KEY,
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  wishlist_name VARCHAR(128),
+  created_date TIMESTAMP,
+  is_public CHAR(1)
+);
+
+The X_Wishlist_Item table stores the products saved inside a wishlist. Each row links a wishlist to a product and records when it was added.
+CREATE TABLE X_Wishlist_Item (
+  item_id BIGINT PRIMARY KEY,
+  wishlist_id BIGINT REFERENCES X_Wishlist(wishlist_id),
+  product_id BIGINT REFERENCES X_Product(product_id),
+  added_date TIMESTAMP
+);
+
+Cart and Order Area
+
+The X_Cart table stores active and abandoned shopping carts. Each cart belongs to a customer and a store and has a cart_status such as ACTIVE, ABANDONED, or CONVERTED once it becomes an order.
+CREATE TABLE X_Cart (
+  cart_id BIGINT PRIMARY KEY,
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  store_id BIGINT REFERENCES X_Store(store_id),
+  created_date TIMESTAMP,
+  updated_date TIMESTAMP,
+  cart_status VARCHAR(16)
+);
+
+The X_Cart_Item table stores the line items inside a cart. Each row references a SKU and the quantity the customer intends to buy.
+CREATE TABLE X_Cart_Item (
+  cart_item_id BIGINT PRIMARY KEY,
+  cart_id BIGINT REFERENCES X_Cart(cart_id),
+  sku_id BIGINT REFERENCES X_SKU(sku_id),
+  quantity INT,
+  added_date TIMESTAMP
+);
+
+The X_Order table is the order header table. It stores one row per placed order with the order_number, the owning customer and store, the order_date, the order_status, the total_amount with currency, and the payment_status. This is the central table for most support queries about orders.
+CREATE TABLE X_Order (
+  order_id BIGINT PRIMARY KEY,
+  order_number VARCHAR(32),
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  store_id BIGINT REFERENCES X_Store(store_id),
+  order_date TIMESTAMP,
+  order_status VARCHAR(16),
+  total_amount DECIMAL(12,2),
+  currency VARCHAR(3),
+  payment_status VARCHAR(16)
+);
+
+The X_Order_Item table stores the individual line items of an order. Each line references the SKU purchased, the quantity, the unit_price at the time of purchase, any discount_amount, and the computed line_total.
+CREATE TABLE X_Order_Item (
+  order_item_id BIGINT PRIMARY KEY,
+  order_id BIGINT REFERENCES X_Order(order_id),
+  sku_id BIGINT REFERENCES X_SKU(sku_id),
+  quantity INT,
+  unit_price DECIMAL(12,2),
+  discount_amount DECIMAL(12,2),
+  line_total DECIMAL(12,2)
+);
+
+The X_Order_Status_History table records every status transition of an order over time. Each row captures the old_status, the new_status, who changed it, when, and any comments. This is the audit trail for order lifecycle questions.
+CREATE TABLE X_Order_Status_History (
+  history_id BIGINT PRIMARY KEY,
+  order_id BIGINT REFERENCES X_Order(order_id),
+  old_status VARCHAR(16),
+  new_status VARCHAR(16),
+  changed_by VARCHAR(128),
+  changed_date TIMESTAMP,
+  comments VARCHAR(512)
+);
+
+Shipment and Fulfillment Area
+
+The X_Shipment table stores shipment records for orders. An order can have multiple shipments. Each shipment records the carrier, tracking_number, ship_date, delivery_date, and shipment_status such as PENDING, SHIPPED, or DELIVERED.
+CREATE TABLE X_Shipment (
+  shipment_id BIGINT PRIMARY KEY,
+  order_id BIGINT REFERENCES X_Order(order_id),
+  carrier VARCHAR(64),
+  tracking_number VARCHAR(128),
+  ship_date TIMESTAMP,
+  delivery_date TIMESTAMP,
+  shipment_status VARCHAR(16)
+);
+
+The X_Shipment_Item table maps shipped quantities back to specific order line items, so partial shipments can be tracked. Each row links a shipment to an order item and records the shipped quantity.
+CREATE TABLE X_Shipment_Item (
+  shipment_item_id BIGINT PRIMARY KEY,
+  shipment_id BIGINT REFERENCES X_Shipment(shipment_id),
+  order_item_id BIGINT REFERENCES X_Order_Item(order_item_id),
+  quantity INT
+);
+
+Payment and Promotion Area
+
+The X_Payment table stores payment transactions against orders. It records the payment_method, payment_amount with currency, the gateway transaction_id, the payment_date, and the payment_status such as AUTHORIZED, CAPTURED, or DECLINED.
+CREATE TABLE X_Payment (
+  payment_id BIGINT PRIMARY KEY,
+  order_id BIGINT REFERENCES X_Order(order_id),
+  payment_method VARCHAR(32),
+  payment_amount DECIMAL(12,2),
+  currency VARCHAR(3),
+  transaction_id VARCHAR(128),
+  payment_date TIMESTAMP,
+  payment_status VARCHAR(16)
+);
+
+The X_Refund table stores refunds issued against payments and orders. Each refund links to the original payment and order, records the refund_amount, the refund_reason, the refund_date, and the refund_status.
+CREATE TABLE X_Refund (
+  refund_id BIGINT PRIMARY KEY,
+  payment_id BIGINT REFERENCES X_Payment(payment_id),
+  order_id BIGINT REFERENCES X_Order(order_id),
+  refund_amount DECIMAL(12,2),
+  refund_reason VARCHAR(255),
+  refund_date TIMESTAMP,
+  refund_status VARCHAR(16)
+);
+
+The X_Promotion table stores marketing promotions and discounts. It holds the promo_code, promo_name, promo_type such as PERCENT or FIXED, the discount_value, the active date range, and an is_active flag.
+CREATE TABLE X_Promotion (
+  promotion_id BIGINT PRIMARY KEY,
+  promo_code VARCHAR(64),
+  promo_name VARCHAR(255),
+  promo_type VARCHAR(16),
+  discount_value DECIMAL(12,2),
+  start_date TIMESTAMP,
+  end_date TIMESTAMP,
+  is_active CHAR(1)
+);
+
+The X_Coupon table stores individual coupon codes generated from a promotion. Coupons can be assigned to a specific customer and track whether and when they were redeemed.
+CREATE TABLE X_Coupon (
+  coupon_id BIGINT PRIMARY KEY,
+  promotion_id BIGINT REFERENCES X_Promotion(promotion_id),
+  coupon_code VARCHAR(64),
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  is_redeemed CHAR(1),
+  redeemed_date TIMESTAMP
+);
+
+The X_Order_Promotion table is a mapping table that records which promotions were applied to which orders and the discount_applied for each. It resolves the many-to-many relationship between orders and promotions.
+CREATE TABLE X_Order_Promotion (
+  id BIGINT PRIMARY KEY,
+  order_id BIGINT REFERENCES X_Order(order_id),
+  promotion_id BIGINT REFERENCES X_Promotion(promotion_id),
+  discount_applied DECIMAL(12,2)
+);
+
+Store Administration Area
+
+The X_Store table stores the sites or stores operated on the platform. Orders, carts, and inventory are all scoped to a store. It records the store_code, store_name, region, default currency, and an is_active flag.
+CREATE TABLE X_Store (
+  store_id BIGINT PRIMARY KEY,
+  store_code VARCHAR(32),
+  store_name VARCHAR(255),
+  region VARCHAR(64),
+  currency VARCHAR(3),
+  is_active CHAR(1)
+);
+
+The X_Return table stores product returns and RMA records. Each return links to the order, the specific order item being returned, the customer, the return_reason, the return_status, and optionally the refund_id once a refund is processed.
+CREATE TABLE X_Return (
+  return_id BIGINT PRIMARY KEY,
+  order_id BIGINT REFERENCES X_Order(order_id),
+  order_item_id BIGINT REFERENCES X_Order_Item(order_item_id),
+  customer_id BIGINT REFERENCES X_Customer(customer_id),
+  return_reason VARCHAR(255),
+  return_status VARCHAR(16),
+  return_date TIMESTAMP,
+  refund_id BIGINT REFERENCES X_Refund(refund_id)
+);
+
+Key Relationships Summary
+
+A customer in X_Customer places orders stored in X_Order. Each order has line items in X_Order_Item, and each line item references a SKU in X_SKU, which belongs to a product in X_Product. To go from an order back to the product name, join X_Order to X_Order_Item on order_id, then X_Order_Item to X_SKU on sku_id, then X_SKU to X_Product on product_id.
+
+Payments in X_Payment reference X_Order through order_id, and refunds in X_Refund reference both the payment and the order. To find the amount refunded for an order, join X_Order to X_Refund on order_id and sum refund_amount.
+
+Shipments in X_Shipment reference X_Order through order_id, and X_Shipment_Item links shipped quantities to X_Order_Item. To track what has shipped for an order, join X_Order to X_Shipment on order_id and then X_Shipment_Item on shipment_id.
+
+Inventory in X_Inventory is tracked per SKU per store, so it joins to X_SKU on sku_id and to X_Store on store_id. Available stock for a product is obtained by joining X_Product to X_SKU on product_id and then X_SKU to X_Inventory on sku_id.
+
+Product media and text live in child tables of X_Product: images are in X_Product_Images, descriptions are in X_Product_Description, specifications are in X_Product_Attributes, prices are in X_Price, and customer reviews are in X_Product_Review. All of these join back to X_Product on product_id.
+
+Category membership is resolved through the mapping table X_Product_Category, which joins X_Product on product_id and X_Category on category_id. The category tree itself is built by following parent_category_id within X_Category.
+
+Promotions in X_Promotion are connected to orders through the mapping table X_Order_Promotion, and coupons generated from a promotion are stored in X_Coupon. Returns in X_Return tie an order item back to a customer and may reference a refund once processed.
+
+Common Query Patterns
+
+To count unique orders for a customer, filter X_Order by customer_id and count distinct order_id. To list a customer's orders with their totals, select from X_Order filtered by customer_id ordered by order_date. To find the top selling products, join X_Order_Item to X_SKU to X_Product and sum quantity grouped by product. To find low stock items, filter X_Inventory where quantity_on_hand is less than reorder_level. To find pending shipments, filter X_Shipment where shipment_status is not DELIVERED. To calculate revenue for a store, sum total_amount from X_Order filtered by store_id and a date range.
+
+Glossary of Domain Terms
+
+SKU means Stock Keeping Unit and represents a specific sellable variant of a product, such as a shirt in a particular color and size. In this schema SKUs live in X_SKU and are the level at which inventory is tracked and items are purchased. A product in X_Product is the higher level concept that groups its SKUs together.
+
+Available-to-promise, often abbreviated ATP, is the stock that can actually be sold right now. It is computed as quantity_on_hand minus quantity_reserved from the X_Inventory table. Reserved stock is inventory that is already committed to open orders but has not shipped yet.
+
+An order line item, stored in X_Order_Item, is a single product variant and quantity within an order. The order header in X_Order holds totals and status, while the line items hold the per-product detail. The line_total on each item is the unit_price multiplied by quantity minus any discount_amount.
+
+A mapping table, also called a junction or associative table, resolves a many-to-many relationship between two entities. In this schema X_Product_Category maps products to categories and X_Order_Promotion maps orders to promotions. Mapping tables always contain the two foreign keys that identify the related rows.
+
+Common Support Scenarios
+
+When a customer contacts support about a missing package, the support engineer usually starts from X_Order using the order_number, then joins to X_Shipment on order_id to read the carrier, tracking_number, and shipment_status. If the shipment_status is SHIPPED but the delivery_date is null, the package is in transit.
+
+When a customer disputes a charge, the engineer looks at X_Payment for the order to confirm the payment_status and payment_amount, then checks X_Refund on the same order_id to see whether a refund has already been issued and for how much. A refund_status of PENDING means the refund is in progress.
+
+When a developer needs to know where a particular piece of product data lives, the rule of thumb is that anything describing a product hangs off X_Product through product_id: images in X_Product_Images, text in X_Product_Description, specs in X_Product_Attributes, prices in X_Price, and reviews in X_Product_Review. Anything about buying or stocking a product happens at the SKU level in X_SKU, X_Inventory, X_Cart_Item, and X_Order_Item.
+
+When investigating why an order looks stuck, the engineer reads X_Order_Status_History for that order_id to see the full sequence of status transitions, who made each change, and when. This audit trail is more reliable than the single order_status value on the X_Order header because it shows the complete history.

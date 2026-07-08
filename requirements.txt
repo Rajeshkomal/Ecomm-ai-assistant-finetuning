@@ -1,0 +1,15 @@
+# Fine-tuning stack (install on a CUDA GPU machine / Google Colab).
+# On Colab, prefer the install cell inside the notebooks (it pulls the latest
+# Unsloth nightly matched to the runtime). These pins are a reproducible baseline.
+unsloth
+trl<0.9.0
+peft>=0.11.0
+transformers>=4.43.0
+datasets>=2.19.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0
+torch>=2.3.0
+
+# Inference / utilities
+sentencepiece
+protobuf

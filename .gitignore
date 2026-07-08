@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Training outputs / model artifacts (keep these in Drive/HF, not git)
+outputs/
+outputs_stage1/
+outputs_stage2/
+outputs_stage3/
+*.bin
+*.safetensors
+*.gguf
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
