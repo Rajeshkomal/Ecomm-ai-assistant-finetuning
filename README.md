@@ -38,16 +38,16 @@ customer, cart/order, fulfillment, payment/promotion, store).
 
 Datasets are also published on the Hugging Face Hub and loaded directly in the notebooks:
 
-- `Rajeshkomal/ecomm-db-noninstruct`
-- `Rajeshkomal/ecomm-db-instruction`
-- `Rajeshkomal/ecomm-db-preference`
+- `Rajesh507/ecomm-db-noninstruct`
+- `Rajesh507/ecomm-db-instruction`
+- `Rajesh507/ecomm-db-preference`
 
 Push them yourself with:
 
 ```bash
 pip install datasets huggingface_hub
 huggingface-cli login
-python scripts/push_to_hf.py --user Rajeshkomal
+python scripts/push_to_hf.py --user Rajesh507
 ```
 
 ## Base model used
@@ -89,7 +89,7 @@ Full rationale in [`reports/fine_tuning_explanation.md`](reports/fine_tuning_exp
 
 Datasets load from Hugging Face; trained adapters save to Google Drive.
 
-1. Push datasets to HF: `python scripts/push_to_hf.py --user Rajeshkomal`
+1. Push datasets to HF: `python scripts/push_to_hf.py --user Rajesh507`
 2. Open each notebook in Colab (GPU: T4) and run top to bottom, **in order**:
 
 | Notebook | Stage | Colab |

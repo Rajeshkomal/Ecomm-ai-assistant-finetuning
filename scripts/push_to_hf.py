@@ -6,8 +6,8 @@ Prerequisites:
     huggingface-cli login   # or set HF_TOKEN env var (needs WRITE access)
 
 Run:
-    python scripts/push_to_hf.py --user Rajeshkomal
-    python scripts/push_to_hf.py --user Rajeshkomal --private
+    python scripts/push_to_hf.py --user Rajesh507
+    python scripts/push_to_hf.py --user Rajesh507 --private
 """
 import argparse
 import os

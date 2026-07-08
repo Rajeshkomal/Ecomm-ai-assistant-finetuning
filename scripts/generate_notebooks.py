@@ -51,7 +51,7 @@ print("CUDA available:", torch.cuda.is_available())
 print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NONE - set Runtime > Change runtime type > T4 GPU")"""
 
 HF_CFG = """# --- Datasets live on the Hugging Face Hub (pushed via scripts/push_to_hf.py) ---
-HF_USER = "Rajeshkomal"   # <-- change if your Hugging Face username differs
+HF_USER = "Rajesh507"   # <-- your Hugging Face username
 DS_NONINSTRUCT = f"{HF_USER}/ecomm-db-noninstruct"
 DS_INSTRUCTION = f"{HF_USER}/ecomm-db-instruction"
 DS_PREFERENCE  = f"{HF_USER}/ecomm-db-preference"
