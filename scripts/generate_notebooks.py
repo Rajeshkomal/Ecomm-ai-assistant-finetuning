@@ -1,5 +1,5 @@
 """Generates the three Colab-ready fine-tuning notebooks as valid .ipynb files.
-Datasets are loaded from the Hugging Face Hub; trained adapters are saved to Google Drive.
+Datasets are loaded from the Hugging Face Hub; trained adapters are pushed to the Hugging Face Hub.
 Run: python scripts/generate_notebooks.py
 """
 import json, os
@@ -40,11 +40,11 @@ def write(name, cells):
 
 
 # Shared snippets -----------------------------------------------------------
-INSTALL = """# Install Unsloth (Colab has a compatible CUDA GPU). Restart runtime if prompted.
+INSTALL = """# Install Unsloth (needs a CUDA GPU). If Colab prompts to restart after install, do it.
 %%capture
-!pip install unsloth
-!pip install --upgrade --no-cache-dir "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-!pip install --no-deps "trl<0.9.0" peft accelerate bitsandbytes"""
+!pip install --upgrade unsloth unsloth_zoo
+# Ensure a MODERN TRL (provides SFTConfig/DPOConfig + processing_class) that matches new transformers.
+!pip install --upgrade "trl>=0.13.1\""""
 
 GPU_CHECK = """import torch
 print("CUDA available:", torch.cuda.is_available())
@@ -59,13 +59,14 @@ DS_PREFERENCE  = f"{HF_USER}/ecomm-db-preference"
 # If the datasets are PRIVATE, log in first (needs a read token):
 # from huggingface_hub import login; login()"""
 
-DRIVE_SAVE = """# Mount Google Drive ONLY to persist trained adapters across sessions.
-from google.colab import drive
-drive.mount('/content/drive')
-import os
-SAVE_DIR = '/content/drive/MyDrive/Ecomm-ai-assistant-finetuning/outputs'
-os.makedirs(SAVE_DIR, exist_ok=True)
-print("Adapters will be saved to:", SAVE_DIR)"""
+HF_SAVE = """# Persist trained adapters to the Hugging Face Hub (no Google Drive needed).
+from huggingface_hub import login
+login()   # paste a WRITE token: https://huggingface.co/settings/tokens
+
+ADAPTER_STAGE1 = f"{HF_USER}/ecomm-db-stage1-noninstruct"
+ADAPTER_STAGE2 = f"{HF_USER}/ecomm-db-stage2-sft"
+ADAPTER_STAGE3 = f"{HF_USER}/ecomm-db-stage3-dpo"
+print("Adapters will be pushed under:", HF_USER)"""
 
 PROMPT_TEMPLATE = '''# A single, consistent prompt template used across ALL three stages.
 PROMPT = """Below is a question about the client e-commerce database schema. \\
@@ -107,12 +108,12 @@ relationships) **before** we teach it to follow instructions in Stage 2.
 
 Pipeline: **Base -> [Stage 1] -> Stage 2 (SFT) -> Stage 3 (DPO)**
 
-Data: loaded from the Hugging Face Hub. Adapters: saved to Google Drive."""),
+Data and adapters both live on the Hugging Face Hub."""),
     code(INSTALL),
     code(GPU_CHECK),
     md("## 1. Config + load the raw domain corpus from Hugging Face"),
     code(HF_CFG),
-    code(DRIVE_SAVE),
+    code(HF_SAVE),
     code("""from datasets import load_dataset
 raw = load_dataset(DS_NONINSTRUCT, split="train")   # column 'text' = one block per row
 blocks = [b for b in raw["text"] if b and b.strip()]
@@ -143,40 +144,26 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 EOS = tokenizer.eos_token
 ds = Dataset.from_dict({"text": [c + EOS for c in chunks]})
 print(ds)"""),
-    md("## 4. Apply LoRA adapters\nFor continued pretraining we also train `embed_tokens` and `lm_head` so the model can absorb new domain tokens."),
-    code("""from unsloth import FastLanguageModel
-model = FastLanguageModel.get_peft_model(
-    model,
-    r = 16,
-    lora_alpha = 16,
-    lora_dropout = 0,
-    bias = "none",
-    target_modules = ["q_proj","k_proj","v_proj","o_proj",
-                      "gate_proj","up_proj","down_proj",
-                      "embed_tokens","lm_head"],
-    use_gradient_checkpointing = "unsloth",
-    random_state = 3407,
-)"""),
+    md("## 4. Apply LoRA adapters"),
+    code(LORA),
     md("## 5. Train on the raw text"),
-    code("""from trl import SFTTrainer
-from transformers import TrainingArguments
+    code("""from trl import SFTTrainer, SFTConfig
 from unsloth import is_bfloat16_supported
 
 trainer = SFTTrainer(
     model = model,
-    tokenizer = tokenizer,
+    processing_class = tokenizer,   # new TRL API (was 'tokenizer=')
     train_dataset = ds,
-    dataset_text_field = "text",
-    max_seq_length = MAX_SEQ_LEN,
-    dataset_num_proc = 2,
-    packing = True,
-    args = TrainingArguments(
+    args = SFTConfig(
+        dataset_text_field = "text",
+        max_seq_length = MAX_SEQ_LEN,
+        dataset_num_proc = 2,
+        packing = True,
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
         warmup_steps = 5,
         num_train_epochs = 3,
-        learning_rate = 5e-5,
-        embedding_learning_rate = 1e-5,
+        learning_rate = 5e-5,       # lower LR for continued pretraining
         fp16 = not is_bfloat16_supported(),
         bf16 = is_bfloat16_supported(),
         logging_steps = 5,
@@ -189,11 +176,10 @@ trainer = SFTTrainer(
     ),
 )
 trainer_stats = trainer.train()"""),
-    md("## 6. Save the Stage-1 adapter to Drive"),
-    code("""stage1_path = os.path.join(SAVE_DIR, 'stage1_noninstruct_adapter')
-model.save_pretrained(stage1_path)
-tokenizer.save_pretrained(stage1_path)
-print("Saved to", stage1_path)"""),
+    md("## 6. Push the Stage-1 adapter to the Hugging Face Hub"),
+    code("""model.push_to_hub(ADAPTER_STAGE1, token=True)
+tokenizer.push_to_hub(ADAPTER_STAGE1, token=True)
+print("Pushed Stage-1 adapter to:", ADAPTER_STAGE1)"""),
     md("## 7. Quick sanity test (completion style, not Q&A yet)"),
     code("""FastLanguageModel.for_inference(model)
 prompt = "The X_Product_Images table stores"
@@ -217,12 +203,12 @@ Data: `ecomm-db-instruction` on the Hugging Face Hub (215 `{instruction, respons
     code(GPU_CHECK),
     md("## 1. Config"),
     code(HF_CFG),
-    code(DRIVE_SAVE),
+    code(HF_SAVE),
     md("## 2. Load model\nStart from the base model, or continue from the Stage-1 adapter for a domain-adapted start."),
     code(MODEL_CFG),
     code("""from unsloth import FastLanguageModel
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = MODEL_NAME,   # or the Stage-1 adapter path in Drive
+    model_name = MODEL_NAME,   # or ADAPTER_STAGE1 to continue from the Stage-1 adapter
     max_seq_length = MAX_SEQ_LEN,
     dtype = None,
     load_in_4bit = True,
@@ -241,19 +227,18 @@ ds = load_dataset(DS_INSTRUCTION, split="train").map(format_examples, batched=Tr
 print(ds)
 print(ds[0]["text"])"""),
     md("## 4. Train (SFT)"),
-    code("""from trl import SFTTrainer
-from transformers import TrainingArguments
+    code("""from trl import SFTTrainer, SFTConfig
 from unsloth import is_bfloat16_supported
 
 trainer = SFTTrainer(
     model = model,
-    tokenizer = tokenizer,
+    processing_class = tokenizer,   # new TRL API (was 'tokenizer=')
     train_dataset = ds,
-    dataset_text_field = "text",
-    max_seq_length = MAX_SEQ_LEN,
-    dataset_num_proc = 2,
-    packing = False,
-    args = TrainingArguments(
+    args = SFTConfig(
+        dataset_text_field = "text",
+        max_seq_length = MAX_SEQ_LEN,
+        dataset_num_proc = 2,
+        packing = False,
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
         warmup_steps = 10,
@@ -271,11 +256,10 @@ trainer = SFTTrainer(
     ),
 )
 trainer_stats = trainer.train()"""),
-    md("## 5. Save the SFT adapter to Drive"),
-    code("""sft_path = os.path.join(SAVE_DIR, 'stage2_sft_adapter')
-model.save_pretrained(sft_path)
-tokenizer.save_pretrained(sft_path)
-print("Saved to", sft_path)"""),
+    md("## 5. Push the SFT adapter to the Hugging Face Hub"),
+    code("""model.push_to_hub(ADAPTER_STAGE2, token=True)
+tokenizer.push_to_hub(ADAPTER_STAGE2, token=True)
+print("Pushed SFT adapter to:", ADAPTER_STAGE2)"""),
     md("## 6. Inference after SFT"),
     code("""FastLanguageModel.for_inference(model)
 
@@ -308,13 +292,12 @@ Data: `ecomm-db-preference` on the Hugging Face Hub (63 `{prompt, chosen, reject
     code(GPU_CHECK),
     md("## 1. Config"),
     code(HF_CFG),
-    code(DRIVE_SAVE),
-    md("## 2. Load the SFT model (Stage 2 adapter from Drive)"),
+    code(HF_SAVE),
+    md("## 2. Load the SFT model (Stage 2 adapter from the Hugging Face Hub)"),
     code(MODEL_CFG),
     code("""from unsloth import FastLanguageModel
-SFT_ADAPTER = os.path.join(SAVE_DIR, 'stage2_sft_adapter')
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = SFT_ADAPTER,
+    model_name = ADAPTER_STAGE2,   # SFT adapter pushed in Stage 2
     max_seq_length = MAX_SEQ_LEN,
     dtype = None,
     load_in_4bit = True,
@@ -348,7 +331,7 @@ from unsloth import is_bfloat16_supported
 dpo_trainer = DPOTrainer(
     model = model,
     ref_model = None,          # LoRA -> no separate reference model needed (saves memory)
-    tokenizer = tokenizer,
+    processing_class = tokenizer,   # new TRL API (was 'tokenizer=')
     train_dataset = ds,
     args = DPOConfig(
         per_device_train_batch_size = 2,
@@ -371,14 +354,13 @@ dpo_trainer = DPOTrainer(
     ),
 )
 dpo_trainer.train()"""),
-    md("## 5. Save the DPO-aligned model"),
-    code("""dpo_path = os.path.join(SAVE_DIR, 'stage3_dpo_adapter')
-model.save_pretrained(dpo_path)
-tokenizer.save_pretrained(dpo_path)
-print("Saved to", dpo_path)
+    md("## 5. Push the DPO-aligned adapter to the Hugging Face Hub"),
+    code("""model.push_to_hub(ADAPTER_STAGE3, token=True)
+tokenizer.push_to_hub(ADAPTER_STAGE3, token=True)
+print("Pushed DPO adapter to:", ADAPTER_STAGE3)
 
-# Optional: merge to a standalone 16-bit model (no adapter needed to load)
-# model.save_pretrained_merged(os.path.join(SAVE_DIR,'final_merged_16bit'), tokenizer, save_method='merged_16bit')"""),
+# Optional: merge to a standalone 16-bit model and push it (no adapter needed to load)
+# model.push_to_hub_merged(f"{HF_USER}/ecomm-db-final-merged", tokenizer, save_method='merged_16bit', token=True)"""),
     md("## 6. Test after DPO"),
     code("""FastLanguageModel.for_inference(model)
 
@@ -394,7 +376,7 @@ for q in [
     "Find the top 5 customers by total spend.",
 ]:
     print("Q:", q); print("A:", ask(q)); print("-"*60)"""),
-    md("### Done\nThree adapters are now in Drive (Stage 1 / 2 / 3). Use `src/inference.py` for the final model and fill in the `reports/` comparison tables."),
+    md("### Done\nThree adapters are now on the Hugging Face Hub (Stage 1 / 2 / 3). Use `src/inference.py` (point `--adapter` at the DPO repo) and fill in the `reports/` comparison tables."),
 ]
 
 write("non_instruction_finetuning.ipynb", nb1)
