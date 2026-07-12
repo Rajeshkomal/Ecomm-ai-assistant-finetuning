@@ -94,6 +94,65 @@ model = FastLanguageModel.get_peft_model(
     random_state = 3407,
 )"""
 
+# Stage 1 also adapts the input/output embeddings so the model can absorb new
+# X_ schema vocabulary during continued pretraining.
+LORA_STAGE1 = """from unsloth import FastLanguageModel
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 16,                       # LoRA rank
+    lora_alpha = 16,              # scaling
+    lora_dropout = 0,             # 0 is optimized in Unsloth
+    bias = "none",
+    target_modules = ["q_proj","k_proj","v_proj","o_proj",
+                      "gate_proj","up_proj","down_proj",
+                      "embed_tokens","lm_head"],   # continued pretraining: also adapt the
+                                                   # input/output embeddings so the model can
+                                                   # actually absorb new X_ schema vocabulary
+    use_gradient_checkpointing = "unsloth",
+    random_state = 3407,
+)"""
+
+# Stage 2 config: continue from the Stage-1 domain-adapted adapter.
+START_MODEL_CFG = MODEL_CFG + """
+
+# Chained pipeline (bootcamp Class-22): Stage 2 CONTINUES from the Stage-1
+# domain-adapted adapter, so the model has already learned the X_ schema
+# vocabulary before we teach Q->A behavior here.
+# Set to MODEL_NAME only if you deliberately want to skip Stage 1 (not recommended).
+START_MODEL = ADAPTER_STAGE1   # fallback: MODEL_NAME"""
+
+# Stage 2 self-check: verbatim training questions must be reproduced, else the
+# adapter is not active / undertrained.
+SELF_CHECK = """# --- Self-check: is the trained adapter ACTUALLY affecting the output? ---
+# These questions are copied VERBATIM from the training set, so a correctly
+# trained + loaded adapter must reproduce the domain-specific answer under
+# greedy decoding. If this FAILS (generic Orders/shipments tables), the adapter
+# is not active or training did not converge - fix that before trusting any
+# other output from this model.
+checks = [
+    ("Give me a query to find unique orders for a customer.", ["X_Order", "DISTINCT", "order_id"]),
+    ("Which table stores product images?",                    ["X_Product_Images"]),
+    ("Where is shipment and tracking information stored?",    ["X_Shipment"]),
+]
+
+all_ok = True
+for q, must_have in checks:
+    ans = ask(q)
+    ok = all(tok.lower() in ans.lower() for tok in must_have)
+    all_ok = all_ok and ok
+    print(f"[{'PASS' if ok else 'FAIL'}] {q}")
+    print("   ->", ans.replace(chr(10), ' ')[:200])
+    if not ok:
+        print("   expected to contain:", must_have)
+
+print("\\nADAPTER ACTIVE + LEARNED:", all_ok)
+assert all_ok, (
+    "Verbatim training examples were NOT reproduced. The adapter is not applied "
+    "or the model is undertrained. Check: (1) you ran the training cell in THIS "
+    "session, (2) START_MODEL points at the Stage-1 adapter, (3) epochs are high "
+    "enough, and re-run without restarting the runtime mid-way."
+)"""
+
 # ---------------------------------------------------------------------------
 # Notebook 1: Non-instruction fine-tuning (continued pretraining on raw text)
 # ---------------------------------------------------------------------------
@@ -145,7 +204,7 @@ EOS = tokenizer.eos_token
 ds = Dataset.from_dict({"text": [c + EOS for c in chunks]})
 print(ds)"""),
     md("## 4. Apply LoRA adapters"),
-    code(LORA),
+    code(LORA_STAGE1),
     md("## 5. Train on the raw text"),
     code("""from trl import SFTTrainer, SFTConfig
 from unsloth import is_bfloat16_supported
@@ -162,7 +221,7 @@ trainer = SFTTrainer(
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
         warmup_steps = 5,
-        num_train_epochs = 3,
+        num_train_epochs = 10,      # more passes so the domain vocabulary actually sticks
         learning_rate = 5e-5,       # lower LR for continued pretraining
         fp16 = not is_bfloat16_supported(),
         bf16 = is_bfloat16_supported(),
@@ -205,10 +264,10 @@ Data: `ecomm-db-instruction` on the Hugging Face Hub (215 `{instruction, respons
     code(HF_CFG),
     code(HF_SAVE),
     md("## 2. Load model\nStart from the base model, or continue from the Stage-1 adapter for a domain-adapted start."),
-    code(MODEL_CFG),
+    code(START_MODEL_CFG),
     code("""from unsloth import FastLanguageModel
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = MODEL_NAME,   # or ADAPTER_STAGE1 to continue from the Stage-1 adapter
+    model_name = START_MODEL,   # continue from the Stage-1 adapter (see START_MODEL above)
     max_seq_length = MAX_SEQ_LEN,
     dtype = None,
     load_in_4bit = True,
@@ -238,11 +297,12 @@ trainer = SFTTrainer(
         dataset_text_field = "text",
         max_seq_length = MAX_SEQ_LEN,
         dataset_num_proc = 2,
-        packing = False,
+        packing = False,        # small dataset: keep one example per sequence
+        padding_free = False,   # avoids the max_length/padding_free error when packing is off
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
         warmup_steps = 10,
-        num_train_epochs = 3,
+        num_train_epochs = 10,  # small dataset: more passes needed for exact X_ schema recall
         learning_rate = 2e-4,
         fp16 = not is_bfloat16_supported(),
         bf16 = is_bfloat16_supported(),
@@ -275,6 +335,7 @@ for q in [
     "Find all shipments that have not been delivered.",
 ]:
     print("Q:", q); print("A:", ask(q)); print("-"*60)"""),
+    code(SELF_CHECK),
     md("### Next\nProceed to `dpo_alignment.ipynb`."),
 ]
 
