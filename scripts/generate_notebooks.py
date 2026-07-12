@@ -74,15 +74,22 @@ MERGED_STAGE1 = f"{HF_USER}/ecomm-db-stage1-merged"
 MERGED_STAGE2 = f"{HF_USER}/ecomm-db-stage2-merged"
 print("Adapters will be pushed under:", HF_USER)"""
 
-PROMPT_TEMPLATE = '''# A single, consistent prompt template used across ALL three stages.
-PROMPT = """Below is a question about the client e-commerce database schema. \\
-Write a response that correctly answers it, giving the exact table name(s) or a valid SQL query.
+CHAT_TEMPLATE = '''# Qwen2.5 NATIVE ChatML format. Qwen was pretrained on this exact structure, so the
+# <|im_start|>assistant marker is a strong, clean "produce the answer now" signal that
+# LoRA can actually latch onto. A custom "### Answer:" template leaves the base model's
+# generic-SQL prior dominant, so rank-16 LoRA fails to override it (the bug we hit).
+SYSTEM = (
+    "You are an assistant for the client e-commerce database. Answer with the exact "
+    "table name(s) or a valid SQL query, using the real schema where every table name "
+    "is prefixed with X_ (e.g. X_Order, X_Product_Images, X_Shipment)."
+)
 
-### Question:
-{}
-
-### Answer:
-{}"""'''
+def to_chat(question, answer=""):
+    return (
+        "<|im_start|>system\\n" + SYSTEM + "<|im_end|>\\n"
+        "<|im_start|>user\\n" + question + "<|im_end|>\\n"
+        "<|im_start|>assistant\\n" + answer
+    )'''
 
 MODEL_CFG = """MODEL_NAME = "unsloth/Qwen2.5-Coder-1.5B"   # Coder variant is stronger at SQL. Alt: "unsloth/Qwen2.5-1.5B"
 MAX_SEQ_LEN = 2048"""
@@ -156,10 +163,11 @@ eval_model, eval_tokenizer = FastLanguageModel.from_pretrained(
 FastLanguageModel.for_inference(eval_model)
 
 def ask(question, max_new_tokens=128):
-    text = PROMPT.format(question, "")
+    text = to_chat(question, "")
     inputs = eval_tokenizer(text, return_tensors="pt").to("cuda")
     out = eval_model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-    return eval_tokenizer.decode(out[0], skip_special_tokens=True).split("### Answer:")[-1].strip()
+    full = eval_tokenizer.decode(out[0], skip_special_tokens=False)
+    return full.split("<|im_start|>assistant\\n")[-1].split("<|im_end|>")[0].strip()
 
 for q in [
 {q_lines}
@@ -342,13 +350,12 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     load_in_4bit = True,
 )"""),
     code(LORA),
-    md("## 3. Load and format the instruction dataset"),
-    code(PROMPT_TEMPLATE),
+    md("## 3. Load and format the instruction dataset (Qwen ChatML)"),
+    code(CHAT_TEMPLATE),
     code("""from datasets import load_dataset
-EOS = tokenizer.eos_token
 
 def format_examples(batch):
-    return {"text": [PROMPT.format(i, r) + EOS
+    return {"text": [to_chat(i, r) + "<|im_end|>"
                      for i, r in zip(batch["instruction"], batch["response"])]}
 
 ds = load_dataset(DS_INSTRUCTION, split="train").map(format_examples, batched=True)
@@ -433,16 +440,15 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     load_in_4bit = True,
 )"""),
     code(LORA),
-    md("## 3. Load and format the preference dataset"),
-    code(PROMPT_TEMPLATE),
+    md("## 3. Load and format the preference dataset (Qwen ChatML)"),
+    code(CHAT_TEMPLATE),
     code("""from datasets import load_dataset
-EOS = tokenizer.eos_token
 
 def format_pref(ex):
     return {
-        "prompt": PROMPT.format(ex["prompt"], ""),
-        "chosen": ex["chosen"] + EOS,
-        "rejected": ex["rejected"] + EOS,
+        "prompt": to_chat(ex["prompt"], ""),
+        "chosen": ex["chosen"] + "<|im_end|>",
+        "rejected": ex["rejected"] + "<|im_end|>",
     }
 
 ds = load_dataset(DS_PREFERENCE, split="train").map(format_pref)
