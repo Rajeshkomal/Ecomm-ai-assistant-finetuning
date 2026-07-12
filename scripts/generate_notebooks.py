@@ -66,6 +66,12 @@ login()   # paste a WRITE token: https://huggingface.co/settings/tokens
 ADAPTER_STAGE1 = f"{HF_USER}/ecomm-db-stage1-noninstruct"
 ADAPTER_STAGE2 = f"{HF_USER}/ecomm-db-stage2-sft"
 ADAPTER_STAGE3 = f"{HF_USER}/ecomm-db-stage3-dpo"
+
+# Merged 16-bit models that chain the stages: Stage N merges its LoRA into the
+# base, and Stage N+1 loads that merged model and adds a FRESH, fully-trainable
+# LoRA on top (bootcamp Class-22's "merge then add new adapter" approach).
+MERGED_STAGE1 = f"{HF_USER}/ecomm-db-stage1-merged"
+MERGED_STAGE2 = f"{HF_USER}/ecomm-db-stage2-merged"
 print("Adapters will be pushed under:", HF_USER)"""
 
 PROMPT_TEMPLATE = '''# A single, consistent prompt template used across ALL three stages.
@@ -117,17 +123,15 @@ _trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 assert _trainable > 0, "No trainable parameters - adapter is frozen; training would do nothing."
 print("Trainable params:", _trainable)"""
 
-# Stage 2 config. Default = a FRESH, guaranteed-trainable LoRA on the base model.
-# The 215-example SFT set already contains every X_ fact (including the eval
-# questions), so this reliably teaches the schema. Continuing a loaded Stage-1
-# adapter in Unsloth can silently load it frozen (training then does nothing),
-# so chaining is opt-in.
+# Stage 2 config. Follows the teaching: non-instruction (Stage 1) -> instruction
+# (Stage 2). We start from the MERGED Stage-1 model (domain adaptation baked into
+# the weights) and add a FRESH, fully-trainable LoRA for instruction tuning.
 START_MODEL_CFG = MODEL_CFG + """
 
-# Stage 2 starting point:
-#   START_MODEL = MODEL_NAME       -> fresh trainable LoRA on the base (reliable default)
-#   START_MODEL = ADAPTER_STAGE1   -> chain from Stage-1 domain adaptation (advanced/optional)
-START_MODEL = MODEL_NAME"""
+# Stage 2 starting point (chained pipeline):
+#   START_MODEL = MERGED_STAGE1  -> continue from Stage-1 domain adaptation (the taught flow)
+#   START_MODEL = MODEL_NAME     -> skip Stage 1 and train on the plain base model
+START_MODEL = MERGED_STAGE1"""
 
 # Stage 2 self-check: verbatim training questions must be reproduced, else the
 # adapter is not active / undertrained.
@@ -243,10 +247,15 @@ trainer = SFTTrainer(
     ),
 )
 trainer_stats = trainer.train()"""),
-    md("## 6. Push the Stage-1 adapter to the Hugging Face Hub"),
+    md("## 6. Push the Stage-1 adapter + merged model to the Hugging Face Hub"),
     code("""model.push_to_hub(ADAPTER_STAGE1, token=True)
 tokenizer.push_to_hub(ADAPTER_STAGE1, token=True)
-print("Pushed Stage-1 adapter to:", ADAPTER_STAGE1)"""),
+print("Pushed Stage-1 adapter to:", ADAPTER_STAGE1)
+
+# Also push a MERGED 16-bit model so Stage 2 can load it as its base and add a
+# FRESH, fully-trainable LoRA on top (chained: non-instruction -> instruction).
+model.push_to_hub_merged(MERGED_STAGE1, tokenizer, save_method="merged_16bit", token=True)
+print("Pushed merged Stage-1 model to:", MERGED_STAGE1)"""),
     md("## 7. Quick sanity test (completion style, not Q&A yet)"),
     code("""FastLanguageModel.for_inference(model)
 prompt = "The X_Product_Images table stores"
@@ -271,11 +280,11 @@ Data: `ecomm-db-instruction` on the Hugging Face Hub (215 `{instruction, respons
     md("## 1. Config"),
     code(HF_CFG),
     code(HF_SAVE),
-    md("## 2. Load model\nStart from the base model, or continue from the Stage-1 adapter for a domain-adapted start."),
+    md("## 2. Load model\nContinue from the merged Stage-1 model (domain-adapted), then add a fresh LoRA. Set `START_MODEL = MODEL_NAME` to skip Stage 1."),
     code(START_MODEL_CFG),
     code("""from unsloth import FastLanguageModel
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = START_MODEL,   # continue from the Stage-1 adapter (see START_MODEL above)
+    model_name = START_MODEL,   # merged Stage-1 model (see START_MODEL above)
     max_seq_length = MAX_SEQ_LEN,
     dtype = None,
     load_in_4bit = True,
@@ -324,10 +333,15 @@ trainer = SFTTrainer(
     ),
 )
 trainer_stats = trainer.train()"""),
-    md("## 5. Push the SFT adapter to the Hugging Face Hub"),
+    md("## 5. Push the SFT adapter + merged model to the Hugging Face Hub"),
     code("""model.push_to_hub(ADAPTER_STAGE2, token=True)
 tokenizer.push_to_hub(ADAPTER_STAGE2, token=True)
-print("Pushed SFT adapter to:", ADAPTER_STAGE2)"""),
+print("Pushed SFT adapter to:", ADAPTER_STAGE2)
+
+# Also push a MERGED 16-bit model so Stage 3 (DPO) can load it as its base and
+# add a fresh LoRA on top.
+model.push_to_hub_merged(MERGED_STAGE2, tokenizer, save_method="merged_16bit", token=True)
+print("Pushed merged Stage-2 model to:", MERGED_STAGE2)"""),
     md("## 6. Inference after SFT"),
     code("""FastLanguageModel.for_inference(model)
 
@@ -362,11 +376,11 @@ Data: `ecomm-db-preference` on the Hugging Face Hub (63 `{prompt, chosen, reject
     md("## 1. Config"),
     code(HF_CFG),
     code(HF_SAVE),
-    md("## 2. Load the SFT model (Stage 2 adapter from the Hugging Face Hub)"),
+    md("## 2. Load the merged SFT model (Stage 2) from the Hugging Face Hub"),
     code(MODEL_CFG),
     code("""from unsloth import FastLanguageModel
 model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = ADAPTER_STAGE2,   # SFT adapter pushed in Stage 2
+    model_name = MERGED_STAGE2,   # merged SFT model from Stage 2 (fresh LoRA added below)
     max_seq_length = MAX_SEQ_LEN,
     dtype = None,
     load_in_4bit = True,
