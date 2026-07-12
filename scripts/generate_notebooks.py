@@ -94,24 +94,6 @@ model = FastLanguageModel.get_peft_model(
     random_state = 3407,
 )"""
 
-# Stage 1 also adapts the input/output embeddings so the model can absorb new
-# X_ schema vocabulary during continued pretraining.
-LORA_STAGE1 = """from unsloth import FastLanguageModel
-model = FastLanguageModel.get_peft_model(
-    model,
-    r = 16,                       # LoRA rank
-    lora_alpha = 16,              # scaling
-    lora_dropout = 0,             # 0 is optimized in Unsloth
-    bias = "none",
-    target_modules = ["q_proj","k_proj","v_proj","o_proj",
-                      "gate_proj","up_proj","down_proj",
-                      "embed_tokens","lm_head"],   # continued pretraining: also adapt the
-                                                   # input/output embeddings so the model can
-                                                   # actually absorb new X_ schema vocabulary
-    use_gradient_checkpointing = "unsloth",
-    random_state = 3407,
-)"""
-
 # Stage 2 config: continue from the Stage-1 domain-adapted adapter.
 START_MODEL_CFG = MODEL_CFG + """
 
@@ -204,7 +186,7 @@ EOS = tokenizer.eos_token
 ds = Dataset.from_dict({"text": [c + EOS for c in chunks]})
 print(ds)"""),
     md("## 4. Apply LoRA adapters"),
-    code(LORA_STAGE1),
+    code(LORA),
     md("## 5. Train on the raw text"),
     code("""from trl import SFTTrainer, SFTConfig
 from unsloth import is_bfloat16_supported
