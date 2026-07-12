@@ -82,17 +82,28 @@ MODEL_CFG = """MODEL_NAME = "unsloth/Qwen2.5-Coder-1.5B"   # Coder variant is st
 MAX_SEQ_LEN = 2048"""
 
 LORA = """from unsloth import FastLanguageModel
-model = FastLanguageModel.get_peft_model(
-    model,
-    r = 16,                       # LoRA rank
-    lora_alpha = 16,              # scaling
-    lora_dropout = 0,             # 0 is optimized in Unsloth
-    bias = "none",
-    target_modules = ["q_proj","k_proj","v_proj","o_proj",
-                      "gate_proj","up_proj","down_proj"],
-    use_gradient_checkpointing = "unsloth",
-    random_state = 3407,
-)"""
+
+# If the loaded model ALREADY has a LoRA adapter (i.e. we continued from a
+# previous stage's adapter), keep training THAT adapter instead of adding a new,
+# conflicting one. Otherwise (a fresh base model) attach a new LoRA adapter.
+if getattr(model, "peft_config", None):
+    print("Model already has a LoRA adapter - continuing to train it.")
+    try:
+        FastLanguageModel.for_training(model)
+    except Exception:
+        pass
+else:
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r = 16,                       # LoRA rank
+        lora_alpha = 16,              # scaling
+        lora_dropout = 0,             # 0 is optimized in Unsloth
+        bias = "none",
+        target_modules = ["q_proj","k_proj","v_proj","o_proj",
+                          "gate_proj","up_proj","down_proj"],
+        use_gradient_checkpointing = "unsloth",
+        random_state = 3407,
+    )"""
 
 # Stage 2 config: continue from the Stage-1 domain-adapted adapter.
 START_MODEL_CFG = MODEL_CFG + """
@@ -345,14 +356,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     dtype = None,
     load_in_4bit = True,
 )"""),
-    code("""from unsloth import FastLanguageModel
-model = FastLanguageModel.get_peft_model(
-    model,
-    r = 16, lora_alpha = 16, lora_dropout = 0, bias = "none",
-    target_modules = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-    use_gradient_checkpointing = "unsloth",
-    random_state = 3407,
-)"""),
+    code(LORA),
     md("## 3. Load and format the preference dataset"),
     code(PROMPT_TEMPLATE),
     code("""from datasets import load_dataset
