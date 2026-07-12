@@ -247,7 +247,15 @@ trainer = SFTTrainer(
     ),
 )
 trainer_stats = trainer.train()"""),
-    md("## 6. Push the Stage-1 adapter + merged model to the Hugging Face Hub"),
+    md("## 6. Quick sanity test (completion style, not Q&A yet)\n"
+       "Run this BEFORE the push below: merging detaches the trained adapter from "
+       "the in-memory model, so test first."),
+    code("""FastLanguageModel.for_inference(model)
+prompt = "The X_Product_Images table stores"
+inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+out = model.generate(**inputs, max_new_tokens=60, temperature=0.3)
+print(tokenizer.decode(out[0], skip_special_tokens=True))"""),
+    md("## 7. Push the Stage-1 adapter + merged model to the Hugging Face Hub"),
     code("""model.push_to_hub(ADAPTER_STAGE1, token=True)
 tokenizer.push_to_hub(ADAPTER_STAGE1, token=True)
 print("Pushed Stage-1 adapter to:", ADAPTER_STAGE1)
@@ -256,12 +264,6 @@ print("Pushed Stage-1 adapter to:", ADAPTER_STAGE1)
 # FRESH, fully-trainable LoRA on top (chained: non-instruction -> instruction).
 model.push_to_hub_merged(MERGED_STAGE1, tokenizer, save_method="merged_16bit", token=True)
 print("Pushed merged Stage-1 model to:", MERGED_STAGE1)"""),
-    md("## 7. Quick sanity test (completion style, not Q&A yet)"),
-    code("""FastLanguageModel.for_inference(model)
-prompt = "The X_Product_Images table stores"
-inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-out = model.generate(**inputs, max_new_tokens=60, temperature=0.3)
-print(tokenizer.decode(out[0], skip_special_tokens=True))"""),
     md("### Next\nProceed to `instruction_finetuning.ipynb`."),
 ]
 
@@ -333,16 +335,11 @@ trainer = SFTTrainer(
     ),
 )
 trainer_stats = trainer.train()"""),
-    md("## 5. Push the SFT adapter + merged model to the Hugging Face Hub"),
-    code("""model.push_to_hub(ADAPTER_STAGE2, token=True)
-tokenizer.push_to_hub(ADAPTER_STAGE2, token=True)
-print("Pushed SFT adapter to:", ADAPTER_STAGE2)
-
-# Also push a MERGED 16-bit model so Stage 3 (DPO) can load it as its base and
-# add a fresh LoRA on top.
-model.push_to_hub_merged(MERGED_STAGE2, tokenizer, save_method="merged_16bit", token=True)
-print("Pushed merged Stage-2 model to:", MERGED_STAGE2)"""),
-    md("## 6. Inference after SFT"),
+    md("## 5. Inference + self-check (BEFORE pushing/merging)\n"
+       "IMPORTANT: run inference here, *before* the merge/push below. "
+       "`push_to_hub_merged` merges the LoRA into the base and detaches the trained "
+       "adapter from the in-memory `model`, so testing afterwards would show the "
+       "untrained base. Verify first, then push."),
     code("""FastLanguageModel.for_inference(model)
 
 def ask(question, max_new_tokens=128):
@@ -358,6 +355,16 @@ for q in [
 ]:
     print("Q:", q); print("A:", ask(q)); print("-"*60)"""),
     code(SELF_CHECK),
+    md("## 6. Push the SFT adapter + merged model to the Hugging Face Hub\n"
+       "Run this only after the self-check above prints `ADAPTER ACTIVE + LEARNED: True`."),
+    code("""model.push_to_hub(ADAPTER_STAGE2, token=True)
+tokenizer.push_to_hub(ADAPTER_STAGE2, token=True)
+print("Pushed SFT adapter to:", ADAPTER_STAGE2)
+
+# Also push a MERGED 16-bit model so Stage 3 (DPO) can load it as its base and
+# add a fresh LoRA on top.
+model.push_to_hub_merged(MERGED_STAGE2, tokenizer, save_method="merged_16bit", token=True)
+print("Pushed merged Stage-2 model to:", MERGED_STAGE2)"""),
     md("### Next\nProceed to `dpo_alignment.ipynb`."),
 ]
 
@@ -430,14 +437,9 @@ dpo_trainer = DPOTrainer(
     ),
 )
 dpo_trainer.train()"""),
-    md("## 5. Push the DPO-aligned adapter to the Hugging Face Hub"),
-    code("""model.push_to_hub(ADAPTER_STAGE3, token=True)
-tokenizer.push_to_hub(ADAPTER_STAGE3, token=True)
-print("Pushed DPO adapter to:", ADAPTER_STAGE3)
-
-# Optional: merge to a standalone 16-bit model and push it (no adapter needed to load)
-# model.push_to_hub_merged(f"{HF_USER}/ecomm-db-final-merged", tokenizer, save_method='merged_16bit', token=True)"""),
-    md("## 6. Test after DPO"),
+    md("## 5. Test after DPO (before pushing)\n"
+       "Run inference here, before the push below, so you always test the trained "
+       "in-memory model."),
     code("""FastLanguageModel.for_inference(model)
 
 def ask(question, max_new_tokens=128):
@@ -452,6 +454,13 @@ for q in [
     "Find the top 5 customers by total spend.",
 ]:
     print("Q:", q); print("A:", ask(q)); print("-"*60)"""),
+    md("## 6. Push the DPO-aligned adapter to the Hugging Face Hub"),
+    code("""model.push_to_hub(ADAPTER_STAGE3, token=True)
+tokenizer.push_to_hub(ADAPTER_STAGE3, token=True)
+print("Pushed DPO adapter to:", ADAPTER_STAGE3)
+
+# Optional: merge to a standalone 16-bit model and push it (no adapter needed to load)
+# model.push_to_hub_merged(f"{HF_USER}/ecomm-db-final-merged", tokenizer, save_method='merged_16bit', token=True)"""),
     md("### Done\nThree adapters are now on the Hugging Face Hub (Stage 1 / 2 / 3). Use `src/inference.py` (point `--adapter` at the DPO repo) and fill in the `reports/` comparison tables."),
 ]
 
