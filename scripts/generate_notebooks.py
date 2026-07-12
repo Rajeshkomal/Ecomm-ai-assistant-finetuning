@@ -74,27 +74,28 @@ MERGED_STAGE1 = f"{HF_USER}/ecomm-db-stage1-merged"
 MERGED_STAGE2 = f"{HF_USER}/ecomm-db-stage2-merged"
 print("Adapters will be pushed under:", HF_USER)"""
 
-CHAT_TEMPLATE = '''# Qwen2.5 NATIVE ChatML format. Qwen was pretrained on this exact structure, so the
-# <|im_start|>assistant marker is a strong, clean "produce the answer now" signal that
-# LoRA can actually latch onto. A custom "### Answer:" template leaves the base model's
-# generic-SQL prior dominant, so rank-16 LoRA fails to override it (the bug we hit).
+CHAT_TEMPLATE = '''# Build prompts with the tokenizer's OWN chat template (apply_chat_template).
+# Using the model's native ChatML guarantees the special tokens (<|im_start|>,
+# <|im_end|>) and boundaries match EXACTLY between training and inference. This
+# requires an Instruct model (it ships a chat_template and sets eos=<|im_end|>);
+# a base/coder model has no chat template and emits FIM tokens (<|fim_*|>) instead.
 SYSTEM = (
     "You are an assistant for the client e-commerce database. Answer with the exact "
     "table name(s) or a valid SQL query, using the real schema where every table name "
     "is prefixed with X_ (e.g. X_Order, X_Product_Images, X_Shipment)."
-)
+)'''
 
-def to_chat(question, answer=""):
-    return (
-        "<|im_start|>system\\n" + SYSTEM + "<|im_end|>\\n"
-        "<|im_start|>user\\n" + question + "<|im_end|>\\n"
-        "<|im_start|>assistant\\n" + answer
-    )'''
-
-MODEL_CFG = """MODEL_NAME = "unsloth/Qwen2.5-Coder-1.5B"   # Coder variant is stronger at SQL. Alt: "unsloth/Qwen2.5-1.5B"
+MODEL_CFG = """MODEL_NAME = "unsloth/Qwen2.5-Coder-1.5B-Instruct"   # Instruct = ChatML-native (eos=<|im_end|>)
+                                                     # AND code/SQL-strong. The non-Instruct
+                                                     # base emits FIM tokens under ChatML.
 MAX_SEQ_LEN = 2048"""
 
 LORA = """from unsloth import FastLanguageModel
+
+# Tokenizer hygiene for SFT with packing=False (avoids padding/loss quirks).
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
 
 # If the loaded model ALREADY has a LoRA adapter (i.e. we continued from a
 # previous stage's adapter), keep training THAT adapter instead of adding a new,
@@ -114,7 +115,8 @@ else:
     model = FastLanguageModel.get_peft_model(
         model,
         r = 16,                       # LoRA rank
-        lora_alpha = 16,              # scaling
+        lora_alpha = 32,              # scaling (alpha/r = 2x): stronger adapter so it can
+                                      # override the base model's generic prior (HR/domain use 32)
         lora_dropout = 0,             # 0 is optimized in Unsloth
         bias = "none",
         target_modules = ["q_proj","k_proj","v_proj","o_proj",
@@ -135,10 +137,14 @@ print("Trainable params:", _trainable)"""
 # the weights) and add a FRESH, fully-trainable LoRA for instruction tuning.
 START_MODEL_CFG = MODEL_CFG + """
 
-# Stage 2 starting point (chained pipeline):
-#   START_MODEL = MERGED_STAGE1  -> continue from Stage-1 domain adaptation (the taught flow)
-#   START_MODEL = MODEL_NAME     -> skip Stage 1 and train on the plain base model
-START_MODEL = MERGED_STAGE1"""
+# Stage 2 starting point:
+#   START_MODEL = MODEL_NAME     -> train SFT directly on the Instruct base. RECOMMENDED now:
+#                                   the old MERGED_STAGE1 was built on the PREVIOUS base model
+#                                   and is incompatible with this Instruct base.
+#   START_MODEL = MERGED_STAGE1  -> full taught chain (non-instruction -> instruction). Use this
+#                                   ONLY after re-running Stage 1 with the new Instruct base so
+#                                   MERGED_STAGE1 is regenerated to match.
+START_MODEL = MODEL_NAME"""
 
 # Merged-reload evaluation (HR-project pattern) -----------------------------
 # Evaluating the in-memory LoRA adapter directly can silently fall back to
@@ -163,11 +169,13 @@ eval_model, eval_tokenizer = FastLanguageModel.from_pretrained(
 FastLanguageModel.for_inference(eval_model)
 
 def ask(question, max_new_tokens=128):
-    text = to_chat(question, "")
+    messages = [{{"role": "system", "content": SYSTEM}},
+                {{"role": "user", "content": question}}]
+    text = eval_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = eval_tokenizer(text, return_tensors="pt").to("cuda")
     out = eval_model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-    full = eval_tokenizer.decode(out[0], skip_special_tokens=False)
-    return full.split("<|im_start|>assistant\\n")[-1].split("<|im_end|>")[0].strip()
+    gen = out[0][inputs["input_ids"].shape[-1]:]   # keep ONLY the newly generated answer
+    return eval_tokenizer.decode(gen, skip_special_tokens=True).strip()
 
 for q in [
 {q_lines}
@@ -340,7 +348,7 @@ Data: `ecomm-db-instruction` on the Hugging Face Hub (215 `{instruction, respons
     md("## 1. Config"),
     code(HF_CFG),
     code(HF_SAVE),
-    md("## 2. Load model\nContinue from the merged Stage-1 model (domain-adapted), then add a fresh LoRA. Set `START_MODEL = MODEL_NAME` to skip Stage 1."),
+    md("## 2. Load model\nDefault trains SFT directly on the ChatML-native Instruct base (`START_MODEL = MODEL_NAME`). To use the full non-instruction -> instruction chain, first re-run Stage 1 with this Instruct base, then set `START_MODEL = MERGED_STAGE1`."),
     code(START_MODEL_CFG),
     code("""from unsloth import FastLanguageModel
 model, tokenizer = FastLanguageModel.from_pretrained(
@@ -355,8 +363,15 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     code("""from datasets import load_dataset
 
 def format_examples(batch):
-    return {"text": [to_chat(i, r) + "<|im_end|>"
-                     for i, r in zip(batch["instruction"], batch["response"])]}
+    texts = []
+    for instr, resp in zip(batch["instruction"], batch["response"]):
+        messages = [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": instr},
+            {"role": "assistant", "content": resp},
+        ]
+        texts.append(tokenizer.apply_chat_template(messages, tokenize=False))
+    return {"text": texts}
 
 ds = load_dataset(DS_INSTRUCTION, split="train").map(format_examples, batched=True)
 print(ds)
@@ -445,10 +460,15 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     code("""from datasets import load_dataset
 
 def format_pref(ex):
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": ex["prompt"]},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     return {
-        "prompt": to_chat(ex["prompt"], ""),
-        "chosen": ex["chosen"] + "<|im_end|>",
-        "rejected": ex["rejected"] + "<|im_end|>",
+        "prompt": prompt,
+        "chosen": ex["chosen"] + tokenizer.eos_token,
+        "rejected": ex["rejected"] + tokenizer.eos_token,
     }
 
 ds = load_dataset(DS_PREFERENCE, split="train").map(format_pref)
