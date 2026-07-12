@@ -133,6 +133,58 @@ START_MODEL_CFG = MODEL_CFG + """
 #   START_MODEL = MODEL_NAME     -> skip Stage 1 and train on the plain base model
 START_MODEL = MERGED_STAGE1"""
 
+# Merged-reload evaluation (HR-project pattern) -----------------------------
+# Evaluating the in-memory LoRA adapter directly can silently fall back to
+# base-model output in some Unsloth/transformers versions (training happens, loss
+# drops to ~0, but generation ignores the adapter). Baking the LoRA into the
+# weights with save_pretrained_merged and RELOADING that merged model removes the
+# ambiguity - the training is now part of the actual weights, so generation cannot
+# bypass it. This is the approach that reliably works in the HR project.
+def merged_eval(stage_tag, questions):
+    q_lines = "\n".join(f"    {q!r}," for q in questions)
+    return f'''# Bake the trained LoRA into the weights, then RELOAD the merged model and
+# evaluate THAT (not the in-memory adapter). See generator notes: this is the
+# HR-project pattern that reliably reflects the training at generation time.
+model.save_pretrained_merged("{stage_tag}_merged_local", tokenizer, save_method="merged_16bit")
+
+eval_model, eval_tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "{stage_tag}_merged_local",
+    max_seq_length = MAX_SEQ_LEN,
+    dtype = None,
+    load_in_4bit = False,   # full 16-bit reload = exact recall of memorized answers
+)
+FastLanguageModel.for_inference(eval_model)
+
+def ask(question, max_new_tokens=128):
+    text = PROMPT.format(question, "")
+    inputs = eval_tokenizer(text, return_tensors="pt").to("cuda")
+    out = eval_model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    return eval_tokenizer.decode(out[0], skip_special_tokens=True).split("### Answer:")[-1].strip()
+
+for q in [
+{q_lines}
+]:
+    print("Q:", q); print("A:", ask(q)); print("-"*60)'''
+
+
+# Stage 1 completion-style sanity check on the reloaded merged model.
+EVAL_STAGE1 = """# Bake the trained LoRA into the weights, then RELOAD the merged model and test IT.
+# Evaluating the in-memory adapter directly can silently show base-model behavior in
+# some Unsloth/transformers versions; merging removes that ambiguity (HR pattern).
+model.save_pretrained_merged("stage1_merged_local", tokenizer, save_method="merged_16bit")
+
+eval_model, eval_tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "stage1_merged_local",
+    max_seq_length = MAX_SEQ_LEN,
+    dtype = None,
+    load_in_4bit = False,
+)
+FastLanguageModel.for_inference(eval_model)
+prompt = "The X_Product_Images table stores"
+inputs = eval_tokenizer(prompt, return_tensors="pt").to("cuda")
+out = eval_model.generate(**inputs, max_new_tokens=60, do_sample=False)
+print(eval_tokenizer.decode(out[0], skip_special_tokens=True))"""
+
 # Stage 2 self-check: verbatim training questions must be reproduced, else the
 # adapter is not active / undertrained.
 SELF_CHECK = """# --- Self-check: is the trained adapter ACTUALLY affecting the output? ---
@@ -157,12 +209,13 @@ for q, must_have in checks:
     if not ok:
         print("   expected to contain:", must_have)
 
-print("\\nADAPTER ACTIVE + LEARNED:", all_ok)
+print("\\nMODEL LEARNED THE SCHEMA:", all_ok)
 assert all_ok, (
-    "Verbatim training examples were NOT reproduced. The adapter is not applied "
-    "or the model is undertrained. Check: (1) you ran the training cell in THIS "
-    "session, (2) START_MODEL points at the Stage-1 adapter, (3) epochs are high "
-    "enough, and re-run without restarting the runtime mid-way."
+    "Verbatim training examples were NOT reproduced by the reloaded merged model. "
+    "This means training did not actually update the weights for these mappings. "
+    "Check: (1) you ran the training cell in THIS session, (2) the dataset loaded "
+    "correctly (ds[0] shows the X_ answers), (3) epochs/LR are high enough, and "
+    "re-run training, then this cell, without restarting the runtime in between."
 )"""
 
 # ---------------------------------------------------------------------------
@@ -248,13 +301,10 @@ trainer = SFTTrainer(
 )
 trainer_stats = trainer.train()"""),
     md("## 6. Quick sanity test (completion style, not Q&A yet)\n"
-       "Run this BEFORE the push below: merging detaches the trained adapter from "
-       "the in-memory model, so test first."),
-    code("""FastLanguageModel.for_inference(model)
-prompt = "The X_Product_Images table stores"
-inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
-out = model.generate(**inputs, max_new_tokens=60, temperature=0.3)
-print(tokenizer.decode(out[0], skip_special_tokens=True))"""),
+       "We save the trained model MERGED and reload it, then test the reloaded model. "
+       "This guarantees we evaluate the trained weights (not an in-memory adapter that "
+       "can silently fall back to base-model output)."),
+    code(EVAL_STAGE1),
     md("## 7. Push the Stage-1 adapter + merged model to the Hugging Face Hub"),
     code("""model.push_to_hub(ADAPTER_STAGE1, token=True)
 tokenizer.push_to_hub(ADAPTER_STAGE1, token=True)
@@ -335,25 +385,15 @@ trainer = SFTTrainer(
     ),
 )
 trainer_stats = trainer.train()"""),
-    md("## 5. Inference + self-check (BEFORE pushing/merging)\n"
-       "IMPORTANT: run inference here, *before* the merge/push below. "
-       "`push_to_hub_merged` merges the LoRA into the base and detaches the trained "
-       "adapter from the in-memory `model`, so testing afterwards would show the "
-       "untrained base. Verify first, then push."),
-    code("""FastLanguageModel.for_inference(model)
-
-def ask(question, max_new_tokens=128):
-    text = PROMPT.format(question, "")
-    inputs = tokenizer(text, return_tensors="pt").to("cuda")
-    out = model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.2, do_sample=False)
-    return tokenizer.decode(out[0], skip_special_tokens=True).split("### Answer:")[-1].strip()
-
-for q in [
-    "Which table stores product images?",
-    "Give me a query to find unique orders for a customer.",
-    "Find all shipments that have not been delivered.",
-]:
-    print("Q:", q); print("A:", ask(q)); print("-"*60)"""),
+    md("## 5. Inference + self-check on the reloaded MERGED model\n"
+       "We save the trained LoRA merged into the weights, reload that merged model, and "
+       "evaluate it. This is the HR-project pattern: it guarantees generation reflects "
+       "the training (evaluating the in-memory adapter can silently show base output)."),
+    code(merged_eval("stage2", [
+        "Which table stores product images?",
+        "Give me a query to find unique orders for a customer.",
+        "Find all shipments that have not been delivered.",
+    ])),
     code(SELF_CHECK),
     md("## 6. Push the SFT adapter + merged model to the Hugging Face Hub\n"
        "Run this only after the self-check above prints `ADAPTER ACTIVE + LEARNED: True`."),
@@ -437,23 +477,14 @@ dpo_trainer = DPOTrainer(
     ),
 )
 dpo_trainer.train()"""),
-    md("## 5. Test after DPO (before pushing)\n"
-       "Run inference here, before the push below, so you always test the trained "
-       "in-memory model."),
-    code("""FastLanguageModel.for_inference(model)
-
-def ask(question, max_new_tokens=128):
-    text = PROMPT.format(question, "")
-    inputs = tokenizer(text, return_tensors="pt").to("cuda")
-    out = model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.2, do_sample=False)
-    return tokenizer.decode(out[0], skip_special_tokens=True).split("### Answer:")[-1].strip()
-
-for q in [
-    "Find the number of unique orders placed by customer 1001.",
-    "Which table stores product images?",
-    "Find the top 5 customers by total spend.",
-]:
-    print("Q:", q); print("A:", ask(q)); print("-"*60)"""),
+    md("## 5. Test after DPO on the reloaded MERGED model\n"
+       "Save the trained model merged, reload it, and evaluate the reloaded model so "
+       "generation always reflects the training (HR-project pattern)."),
+    code(merged_eval("stage3", [
+        "Find the number of unique orders placed by customer 1001.",
+        "Which table stores product images?",
+        "Find the top 5 customers by total spend.",
+    ])),
     md("## 6. Push the DPO-aligned adapter to the Hugging Face Hub"),
     code("""model.push_to_hub(ADAPTER_STAGE3, token=True)
 tokenizer.push_to_hub(ADAPTER_STAGE3, token=True)
