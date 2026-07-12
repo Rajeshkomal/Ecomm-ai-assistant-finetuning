@@ -92,6 +92,11 @@ if getattr(model, "peft_config", None):
         FastLanguageModel.for_training(model)
     except Exception:
         pass
+    # A loaded adapter is often frozen (inference mode); re-enable grads so
+    # training actually updates it.
+    for _n, _p in model.named_parameters():
+        if "lora_" in _n:
+            _p.requires_grad_(True)
 else:
     model = FastLanguageModel.get_peft_model(
         model,
@@ -103,16 +108,26 @@ else:
                           "gate_proj","up_proj","down_proj"],
         use_gradient_checkpointing = "unsloth",
         random_state = 3407,
-    )"""
+    )
 
-# Stage 2 config: continue from the Stage-1 domain-adapted adapter.
+# Sanity: there MUST be trainable parameters, else trainer.train() does nothing
+# and the model stays generic. This catches a frozen/misloaded adapter early.
+model.print_trainable_parameters()
+_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+assert _trainable > 0, "No trainable parameters - adapter is frozen; training would do nothing."
+print("Trainable params:", _trainable)"""
+
+# Stage 2 config. Default = a FRESH, guaranteed-trainable LoRA on the base model.
+# The 215-example SFT set already contains every X_ fact (including the eval
+# questions), so this reliably teaches the schema. Continuing a loaded Stage-1
+# adapter in Unsloth can silently load it frozen (training then does nothing),
+# so chaining is opt-in.
 START_MODEL_CFG = MODEL_CFG + """
 
-# Chained pipeline (bootcamp Class-22): Stage 2 CONTINUES from the Stage-1
-# domain-adapted adapter, so the model has already learned the X_ schema
-# vocabulary before we teach Q->A behavior here.
-# Set to MODEL_NAME only if you deliberately want to skip Stage 1 (not recommended).
-START_MODEL = ADAPTER_STAGE1   # fallback: MODEL_NAME"""
+# Stage 2 starting point:
+#   START_MODEL = MODEL_NAME       -> fresh trainable LoRA on the base (reliable default)
+#   START_MODEL = ADAPTER_STAGE1   -> chain from Stage-1 domain adaptation (advanced/optional)
+START_MODEL = MODEL_NAME"""
 
 # Stage 2 self-check: verbatim training questions must be reproduced, else the
 # adapter is not active / undertrained.
